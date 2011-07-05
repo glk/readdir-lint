@@ -46,15 +46,16 @@
 #define	DIRSIZE_BLOCK		512
 #define	DIRSIZE_PAGE		4096
 
-#define DIRENT_MAX		512
+#define DIRENT_HDRSIZE		(sizeof(struct dirent) - MAXNAMLEN - 1)
 
 #define DP_NEXT(a)		((struct dirent *)(((char *)(a)) + a->d_reclen))
 
+#define WARN_NOISE		10
 #define WARNX(var, fmt, ...)					\
 	do {							\
-		if ((var) == 0) {				\
+		if ((var) < WARN_NOISE) {			\
 			printf(fmt "\n", ## __VA_ARGS__ );	\
-			var = 1;				\
+			var++;					\
 		}						\
 	} while (0)
 
@@ -64,12 +65,14 @@ static char *opt_path;
 
 #ifdef HAVE_DIRENT_NAMLEN
 static int warn_nameterm;
+static int warn_namelen;
 #endif
 static int warn_noerr;
 static int warn_seekoff;
 static int warn_zeroino;
 static int warn_zerooff;
 static int warn_reclen;
+static int warn_overflow;
 
 struct dirbuf {
 	struct dirent *dp, *begin, *end;
@@ -115,9 +118,11 @@ dir_readx(struct dirbuf *dir)
 	off_t seekoff;
 	int rv;
 
+	memset(dir->begin, 0xAA, dir->bufsize);
 	rv = getdirentries(dir->fd, (char *)dir->begin, dir->bufsize, &dir->base);
 	if (opt_verbose >= 3)
-		printf("dir_read %d: len=%d base=%ld\n", dir->fd, rv, dir->base);
+		printf("dir_read %d: len=%d base=%ld\n",
+		    dir->fd, rv, dir->base);
 	if (rv == -1)
 		return (rv);
 	if (rv == 0) {
@@ -125,35 +130,58 @@ dir_readx(struct dirbuf *dir)
 		dir->dp = NULL;
 		dir->end = NULL;
 	} else {
+		if (rv > (int)dir->bufsize)
+			WARNX(warn_overflow, "Buffer overflow: buffer size %zd,"
+			    " %d bytes written", dir->bufsize, rv);
 		dir->dp = dir->begin;
 		dir->end = (struct dirent *)((char *)dir->begin + rv);
 		seekoff = dir_offset(dir);
 		for (di = dir->dp; di < dir->end; di = DP_NEXT(di)) {
 			if (di->d_reclen <= 0 ||
 			    di->d_reclen > (char *)dir->end - (char *)di) {
-				WARNX(warn_reclen, "Invalid entry size: %d", di->d_reclen);
-				dir->end = di;
-				break;
+				WARNX(warn_reclen, "Invalid entry size: %d, "
+				    "space left %d: d_fileno=%ju d_off=%08jx",
+				    di->d_reclen,
+				    (int)((char *)dir->end - (char *)di),
+				    (uintmax_t)di->d_fileno,
+				    (uintmax_t)di->d_off);
+				if (di->d_reclen <= 0) {
+					rv -= (char *)dir->end - (char *)di;
+					dir->end = di;
+					break;
+				}
+
+				di->d_reclen = (char *)dir->end - (char *)di;
 			}
 #ifdef HAVE_DIRENT_NAMLEN
-			if (di->d_namlen > MAXNAMLEN)
-				errx(1, "Ivalid name lenghth: %d", di->d_namlen);
+			if (di->d_namlen > MAXNAMLEN || di->d_namlen >=
+			    di->d_reclen - DIRENT_HDRSIZE)
+				WARNX(warn_namelen, "Ivalid name length: %d "
+				    "(reclen %d, max %d)",
+				    di->d_namlen, di->d_reclen,
+				    di->d_reclen - (int)DIRENT_HDRSIZE);
 			if (di->d_name[di->d_namlen] != '\0') {
 				di->d_name[di->d_namlen] = '\0';
-				WARNX(warn_nameterm, "Entry names are not NUL-terminated");
+				WARNX(warn_nameterm,
+				    "Entry names are not NUL-terminated");
 			}
 #else
 #endif
 			if (di->d_fileno == 0) {
-				WARNX(warn_zeroino, "Zero d_fileno: %08jx %s",
-				    (uintmax_t)di->d_off, di->d_name);
+				WARNX(warn_zeroino,
+				    "Zero d_fileno: 0x%08jx #%ju '%s'",
+				    (uintmax_t)di->d_off,
+				    (uintmax_t)di->d_fileno, di->d_name);
 			}
 			if (di->d_off == 0)
-				WARNX(warn_zerooff, "Zero d_off: %ju %s",
+				WARNX(warn_zerooff,
+				    "Zero d_off: 0x%08jx #%ju '%s'",
+				    (uintmax_t)di->d_off,
 				    (uintmax_t)di->d_fileno, di->d_name);
 			if (DP_NEXT(di) >= dir->end && di->d_off != seekoff) {
-				WARNX(warn_seekoff, "Directory(%zd) and last entry offsets mismatch: %ju -- %ju",
-				    dir->bufsize, (uintmax_t)seekoff, (uintmax_t)di->d_off);
+				WARNX(warn_seekoff, "Directory and last "
+				    "entry offsets mismatch: %08jx -- %08jx",
+				    (uintmax_t)seekoff, (uintmax_t)di->d_off);
 			}
 		}
 	}
@@ -213,19 +241,26 @@ dir_cmpent(struct dirbuf *dir1, struct dirbuf *dir2)
 	dp2 = dir2->dp;
 
 	if (dir1->eof != dir2->eof)
-		errx(3, "Invalid EOF: %d %ld -- %d %ld",
+		errx(3, "Invalid EOF: %d base: 0x%08lx -- %d base: 0x%08lx",
 		    dir1->eof, dir1->base, dir2->eof, dir2->base);
 	else if (dir1->eof)
 		return (1);
 	if (opt_verbose >= 2)
-		printf("   %08jx (%d bytes) %-12s -- %08jx (%d bytes) %-12s\n",
-		    (uintmax_t)dp1->d_off, dp1->d_reclen, dp1->d_name,
-		    (uintmax_t)dp2->d_off, dp2->d_reclen, dp2->d_name);
+		printf("   0x%08jx #%-8ju '%-12s' (reclen %d) -- "
+		    "0x%08jx #%-8ju '%-12s' (reclen %d)\n",
+		    (uintmax_t)dp1->d_off, (uintmax_t)dp1->d_fileno,
+		    dp1->d_name, dp1->d_reclen,
+		    (uintmax_t)dp2->d_off, (uintmax_t)dp2->d_fileno,
+		    dp2->d_name, dp2->d_reclen);
 	if (strcmp(dp1->d_name, dp2->d_name) != 0 ||
-	    dp1->d_off != dp2->d_off)
-		printf("Entries mismatch: %08jx (%d bytes) %-12s -- %08jx (%d bytes) %-12s\n",
-		    (uintmax_t)dp1->d_off, dp1->d_reclen, dp1->d_name,
-		    (uintmax_t)dp2->d_off, dp2->d_reclen, dp2->d_name);
+	    dp1->d_off != dp2->d_off) {
+		printf("Entries mismatch: 0x%08jx #%-8ju '%-12s' (reclen %d) "
+		    "-- 0x%08jx #%-8ju '%-12s' (reclen %d)\n",
+		    (uintmax_t)dp1->d_off, (uintmax_t)dp1->d_fileno,
+		    dp1->d_name, dp1->d_reclen,
+		    (uintmax_t)dp2->d_off, (uintmax_t)dp2->d_fileno,
+		    dp2->d_name, dp2->d_reclen);
+	}
 
 	return (0);
 }
@@ -287,10 +322,14 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
 			len = dir_readx(dir);
 			if (len <= 0) {
 				if (prevoff != dir_offset(dir))
-					errx(2, "Directory offset changed but no data read: %jd %jd",
-					    (uintmax_t)prevoff, (uintmax_t)dir_offset(dir));
+					errx(2, "Directory offset changed but "
+					    "no data read: 0x%08jx 0x%08jx",
+					    (uintmax_t)prevoff,
+					    (uintmax_t)dir_offset(dir));
 				if (len == 0) {
-					WARNX(warn_noerr, "EINVAL expected for small buffer read, 0 byte result");
+					WARNX(warn_noerr,
+					    "EINVAL expected for small buffer "
+					    "read, 0 byte result");
 					continue;
 				}
 				if (errno == EINVAL)
@@ -298,13 +337,16 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
 				err(1, "Directory read");
 			}
 			if (opt_verbose >= 1)
-				printf("   min size %08jx (%d of %zd bytes) %s\n",
-				    (uintmax_t)dir->dp->d_off, dir->dp->d_reclen, dir->bufsize,
-				    dir->dp->d_name);
+				printf("   min size: 0x%08jx #%-8ju '%s' "
+				    "(buffer: %d of %zd bytes)\n",
+				    (uintmax_t)dir->dp->d_off,
+				    (uintmax_t)dir->dp->d_fileno,
+				    dir->dp->d_name,
+				    dir->dp->d_reclen, dir->bufsize);
 			break;
 		}
 		if (dir->bufsize > DIRSIZE_ENTRY) {
-			errx(2, "Couldn't read entry at offset %jd",
+			errx(2, "Couldn't read entry at offset 0x%08jx",
 			    (uintmax_t)dir_offset(dir));
 		}
 		dir->eof = 0;
