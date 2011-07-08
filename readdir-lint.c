@@ -40,6 +40,10 @@
 #define HAVE_GETPROGNAME
 #endif
 
+#ifdef NO_DIRENT_OFF
+#define d_off			d_fileno
+#endif
+
 #define	DIRSIZE_MAX		(4*1024*1024)
 #define	DIRSIZE_ENTRY		(sizeof(struct dirent))
 #define	DIRSIZE_MIN		((sizeof (struct dirent) - (MAXNAMLEN+1)) + 4)
@@ -67,10 +71,12 @@ static char *opt_path;
 static int warn_nameterm;
 static int warn_namelen;
 #endif
-static int warn_noerr;
+#ifndef NO_DIRENT_OFF
 static int warn_seekoff;
-static int warn_zeroino;
 static int warn_zerooff;
+#endif
+static int warn_noerr;
+static int warn_zeroino;
 static int warn_reclen;
 static int warn_overflow;
 
@@ -169,13 +175,14 @@ dir_readx(struct dirbuf *dir)
 #endif
 			if (di->d_fileno == 0) {
 				WARNX(warn_zeroino,
-				    "Zero d_fileno: 0x%08jx #%ju '%s'",
+				    "Zero d_fileno: 0x%08jx #%ju %s",
 				    (uintmax_t)di->d_off,
 				    (uintmax_t)di->d_fileno, di->d_name);
 			}
+#ifndef NO_DIRENT_OFF
 			if (di->d_off == 0)
 				WARNX(warn_zerooff,
-				    "Zero d_off: 0x%08jx #%ju '%s'",
+				    "Zero d_off: 0x%08jx #%ju %s",
 				    (uintmax_t)di->d_off,
 				    (uintmax_t)di->d_fileno, di->d_name);
 			if (DP_NEXT(di) >= dir->end && di->d_off != seekoff) {
@@ -183,6 +190,7 @@ dir_readx(struct dirbuf *dir)
 				    "entry offsets mismatch: %08jx -- %08jx",
 				    (uintmax_t)seekoff, (uintmax_t)di->d_off);
 			}
+#endif
 		}
 	}
 
@@ -224,6 +232,9 @@ dir_seek(struct dirbuf *dir, off_t off)
 	int rv;
 
 	rv = lseek(dir->fd, off, SEEK_SET);
+	if (opt_verbose >= 3)
+		printf("dir_seek %d: offset 0x%08jx, result %d\n",
+		    dir->fd, (uintmax_t)off, rv);
 	if (rv == -1)
 		err(3, "seek(%jd, SEEK_SET)", (uintmax_t)off);
 	dir->dp = NULL;
@@ -246,16 +257,17 @@ dir_cmpent(struct dirbuf *dir1, struct dirbuf *dir2)
 	else if (dir1->eof)
 		return (1);
 	if (opt_verbose >= 2)
-		printf("   0x%08jx #%-8ju '%-12s' (reclen %d) -- "
-		    "0x%08jx #%-8ju '%-12s' (reclen %d)\n",
+		printf("   0x%08jx #%-8ju %-12s (reclen %d) -- "
+		    "0x%08jx #%-8ju %-12s (reclen %d)\n",
 		    (uintmax_t)dp1->d_off, (uintmax_t)dp1->d_fileno,
 		    dp1->d_name, dp1->d_reclen,
 		    (uintmax_t)dp2->d_off, (uintmax_t)dp2->d_fileno,
 		    dp2->d_name, dp2->d_reclen);
 	if (strcmp(dp1->d_name, dp2->d_name) != 0 ||
+	    dp1->d_fileno != dp2->d_fileno ||
 	    dp1->d_off != dp2->d_off) {
-		printf("Entries mismatch: 0x%08jx #%-8ju '%-12s' (reclen %d) "
-		    "-- 0x%08jx #%-8ju '%-12s' (reclen %d)\n",
+		printf("Entries mismatch: 0x%08jx #%-8ju %-12s (reclen %d) "
+		    "-- 0x%08jx #%-8ju %-12s (reclen %d)\n",
 		    (uintmax_t)dp1->d_off, (uintmax_t)dp1->d_fileno,
 		    dp1->d_name, dp1->d_reclen,
 		    (uintmax_t)dp2->d_off, (uintmax_t)dp2->d_fileno,
@@ -301,22 +313,31 @@ test_bufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
 }
 
 static void
-test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
+test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir, int fuzzy)
 {
-	int len;
+	off_t prevoff;
+	int len, cnt;
 
 	if (opt_skip > 0) {
 		opt_skip--;
 		return;
 	}
 
-	printf("Test minimal buffer size\n");
+	printf("Test minimal buffer size (fuzzy %d)\n", fuzzy);
 	dir_init(dir, opt_path, DIRSIZE_ENTRY);
 	dir_seek(dir_expect, 0);
 	dir_read(dir_expect);
+	cnt = 0;
 	while(!dir_expect->eof) {
-		off_t prevoff = dir_offset(dir);
-
+		cnt++;
+#ifndef NO_DIRENT_OFF
+		if (fuzzy >= 2 && cnt % fuzzy == 0) {
+			dir_seek(dir, dir_expect->dp->d_off);
+			dir_next(dir_expect);
+			continue;
+		}
+#endif
+		prevoff = dir_offset(dir);
 		for (dir->bufsize = DIRSIZE_MIN; dir->bufsize <= DIRSIZE_ENTRY;
 		    dir->bufsize += 4) {
 			len = dir_readx(dir);
@@ -337,7 +358,7 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
 				err(1, "Directory read");
 			}
 			if (opt_verbose >= 1)
-				printf("   min size: 0x%08jx #%-8ju '%s' "
+				printf("   min size: 0x%08jx #%-8ju %s "
 				    "(buffer: %d of %zd bytes)\n",
 				    (uintmax_t)dir->dp->d_off,
 				    (uintmax_t)dir->dp->d_fileno,
@@ -352,8 +373,10 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
 		dir->eof = 0;
 		if (dir_cmpent(dir_expect, dir) != 0)
 			break;
+#ifndef NO_DIRENT_OFF
+		dir_seek(dir, dir_expect->dp->d_off);
+#endif
 		dir_next(dir_expect);
-		dir_seek(dir, dir->dp->d_off);
 	}
 	dir_destroy(dir);
 }
@@ -405,7 +428,11 @@ main(int argc, char **argv)
 		errx(1, "Directory is too large");
 
 	test_bufsize(&dir_max, &dir_i);
-	test_minbufsize(&dir_max, &dir_i);
+	test_minbufsize(&dir_max, &dir_i, 0);
+#ifndef NO_DIRENT_OFF
+	test_minbufsize(&dir_max, &dir_i, 2);
+	test_minbufsize(&dir_max, &dir_i, 5);
+#endif
 
 	return (0);
 }
