@@ -65,6 +65,8 @@
 
 static int opt_verbose;
 static int opt_skip;
+static size_t opt_minsize_start = DIRSIZE_MIN;
+static size_t opt_minsize_end = sizeof(struct dirent);
 static char *opt_path;
 
 #ifdef HAVE_DIRENT_NAMLEN
@@ -75,6 +77,7 @@ static int warn_namelen;
 static int warn_seekoff;
 static int warn_zerooff;
 #endif
+static int warn_offchange;
 static int warn_noerr;
 static int warn_zeroino;
 static int warn_reclen;
@@ -296,15 +299,23 @@ dir_lint(struct dirbuf *dir1, struct dirbuf *dir2)
 static void
 test_bufsize(struct dirbuf *dir_expect, struct dirbuf *dir)
 {
-	int tests_bufsize[] = { DIRSIZE_PAGE, DIRSIZE_BLOCK, DIRSIZE_ENTRY, 0 };
-	int *ip;
+	size_t tests_bufsize[] = {
+		DIRSIZE_PAGE, DIRSIZE_BLOCK, DIRSIZE_ENTRY, 0
+	};
+	size_t *ip;
 
 	for (ip = tests_bufsize; *ip != 0; ip++) {
 		if (opt_skip > 0) {
 			opt_skip--;
 			continue;
 		}
-		printf("Test buffer sizes: %d -- %d\n", DIRSIZE_MAX, *ip);
+		if (*ip < opt_minsize_end) {
+			printf("Skip test buffer sizes: %zd -- %zd\n",
+			    (size_t)DIRSIZE_MAX, *ip);
+			continue;
+		}
+		printf("Test buffer sizes: %zd -- %zd\n",
+		    (size_t)DIRSIZE_MAX, *ip);
 		dir_init(dir, opt_path, *ip);
 		dir_seek(dir_expect, 0);
 		dir_lint(dir_expect, dir);
@@ -324,7 +335,7 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir, int fuzzy)
 	}
 
 	printf("Test minimal buffer size (fuzzy %d)\n", fuzzy);
-	dir_init(dir, opt_path, DIRSIZE_ENTRY);
+	dir_init(dir, opt_path, opt_minsize_end);
 	dir_seek(dir_expect, 0);
 	dir_read(dir_expect);
 	cnt = 0;
@@ -338,15 +349,18 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir, int fuzzy)
 		}
 #endif
 		prevoff = dir_offset(dir);
-		for (dir->bufsize = DIRSIZE_MIN; dir->bufsize <= DIRSIZE_ENTRY;
-		    dir->bufsize += 4) {
+		for (dir->bufsize = opt_minsize_start;
+		    dir->bufsize <= opt_minsize_end; dir->bufsize += 4) {
 			len = dir_readx(dir);
 			if (len <= 0) {
-				if (prevoff != dir_offset(dir))
-					errx(2, "Directory offset changed but "
+				if (prevoff != dir_offset(dir)) {
+					WARNX(warn_offchange,
+					    "Directory offset changed but "
 					    "no data read: 0x%08jx 0x%08jx",
 					    (uintmax_t)prevoff,
 					    (uintmax_t)dir_offset(dir));
+					continue;
+				}
 				if (len == 0) {
 					WARNX(warn_noerr,
 					    "EINVAL expected for small buffer "
@@ -366,7 +380,7 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir, int fuzzy)
 				    dir->dp->d_reclen, dir->bufsize);
 			break;
 		}
-		if (dir->bufsize > DIRSIZE_ENTRY) {
+		if (dir->bufsize > opt_minsize_end) {
 			errx(2, "Couldn't read entry at offset 0x%08jx",
 			    (uintmax_t)dir_offset(dir));
 		}
@@ -384,7 +398,8 @@ test_minbufsize(struct dirbuf *dir_expect, struct dirbuf *dir, int fuzzy)
 static void
 usage(int exitcode)
 {
-	fprintf(stderr, "usage: %s directory\n", getprogname());
+	fprintf(stderr, "usage: %s [-v] [-s skip] [-mM minsize] directory\n",
+	    getprogname());
 	exit(exitcode);
 }
 
@@ -396,8 +411,26 @@ main(int argc, char **argv)
 	int len, opt;
 	long prevbase;
 
-	while ((opt = getopt(argc, argv, "hs:v")) != -1) {
+	while ((opt = getopt(argc, argv, "hm:M:s:v")) != -1) {
 		switch (opt) {
+		case 'm':
+			opt_minsize_start = atoi(optarg);
+			if (opt_minsize_start < DIRSIZE_MIN ||
+			    opt_minsize_start % 4 != 0) {
+				fprintf(stderr, "invalid option argument: %s",
+				    optarg);
+				return (-1);
+			}
+			break;
+		case 'M':
+			opt_minsize_end = atoi(optarg);
+			if (opt_minsize_end < DIRSIZE_MIN ||
+			    opt_minsize_end % 4 != 0) {
+				fprintf(stderr, "invalid option argument: %s",
+				    optarg);
+				return (-1);
+			}
+			break;
 		case 's':
 			opt_skip = atoi(optarg);
 			break;
@@ -419,6 +452,8 @@ main(int argc, char **argv)
 	if (argc == 0)
 		usage(1);
 	opt_path = argv[0];
+	if (opt_minsize_end < opt_minsize_start)
+		opt_minsize_end = opt_minsize_start;
 
 	dir_init(&dir_max, opt_path, DIRSIZE_MAX);
 	dir_read(&dir_max);
