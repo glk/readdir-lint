@@ -181,6 +181,7 @@ dir_readx(struct dirbuf *dir)
 				    "Zero d_fileno: 0x%08jx #%ju %s",
 				    (uintmax_t)di->d_off,
 				    (uintmax_t)di->d_fileno, di->d_name);
+				continue;
 			}
 #ifndef NO_DIRENT_OFF
 			if (di->d_off == 0)
