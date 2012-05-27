@@ -129,9 +129,13 @@ dir_readx(struct dirbuf *dir)
 
 	memset(dir->begin, 0xAA, dir->bufsize);
 	rv = getdirentries(dir->fd, (char *)dir->begin, dir->bufsize, &dir->base);
+	if (rv != -1)
+		seekoff = dir_offset(dir);
+	else
+		seekoff = -1;
 	if (opt_verbose >= 3)
-		printf("dir_read %d: len=%d base=%ld\n",
-		    dir->fd, rv, dir->base);
+		printf("dir_read %d: len=%d base=%ld bufsize=%zd off=%jd\n",
+		    dir->fd, rv, dir->base, dir->bufsize, (intmax_t)seekoff);
 	if (rv == -1)
 		return (rv);
 	if (rv == 0) {
@@ -144,7 +148,6 @@ dir_readx(struct dirbuf *dir)
 			    " %d bytes written", dir->bufsize, rv);
 		dir->dp = dir->begin;
 		dir->end = (struct dirent *)((char *)dir->begin + rv);
-		seekoff = dir_offset(dir);
 		for (di = dir->dp; di < dir->end; di = DP_NEXT(di)) {
 			if (di->d_reclen <= 0 ||
 			    di->d_reclen > (char *)dir->end - (char *)di) {
